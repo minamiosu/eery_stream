@@ -1,0 +1,67 @@
+{
+  "name": "eery",
+  "version": "1.0.0",
+  "private": true,
+  "description": "App minimalista de captura e transmissão de tela em baixa latência",
+  "type": "module",
+  "main": "dist/main/main.js",
+  "scripts": {
+    "build": "tsc && node scripts/copy-assets.mjs",
+    "check": "tsc --noEmit",
+    "start": "pnpm run build && electron .",
+    "pack:dir": "pnpm run build && electron-builder --win dir --x64",
+    "pack:exe": "pnpm run build && electron-builder --win portable --x64"
+  },
+  "build": {
+    "appId": "com.eery.desktop",
+    "productName": "Eery",
+    "directories": {
+      "output": "release"
+    },
+    "files": [
+      "dist/**/*",
+      "package.json",
+      "!**/node_modules/loopback-capture/prebuilds/linux-x64/**",
+      "!**/node_modules/loopback-capture/src/**"
+    ],
+    "asarUnpack": [
+      "**/node_modules/loopback-capture/**"
+    ],
+    "protocols": {
+      "name": "Eery Cast",
+      "schemes": [
+        "eerycast"
+      ]
+    },
+    "win": {
+      "target": [
+        {
+          "target": "portable",
+          "arch": [
+            "x64"
+          ]
+        }
+      ],
+      "signAndEditExecutable": false
+    },
+    "portable": {
+      "artifactName": "Eery.exe"
+    }
+  },
+  "devEngines": {
+    "packageManager": {
+      "name": "pnpm",
+      "version": "^11.5.2",
+      "onFail": "download"
+    }
+  },
+  "devDependencies": {
+    "@types/node": "^26.6.6",
+    "electron": "^45.3.3",
+    "electron-builder": "^26.18.0",
+    "typescript": "^7.0.2"
+  },
+  "dependencies": {
+    "loopback-capture": "^4.0.0"
+  }
+}

@@ -1,0 +1,133 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; img-src 'self' data:; media-src 'self' blob: mediastream:; style-src 'self'; script-src 'self'; connect-src 'self' ws: wss:;">
+  <title>Eery</title>
+  <link rel="stylesheet" href="./styles.css">
+</head>
+<body>
+  <svg xmlns="http://www.w3.org/2000/svg" class="svg-sprite" aria-hidden="true">
+    <symbol id="i-monitor" viewBox="0 0 24 24">
+      <rect width="20" height="14" x="2" y="3" rx="2"/>
+      <line x1="8" x2="16" y1="21" y2="21"/>
+      <line x1="12" x2="12" y1="17" y2="21"/>
+    </symbol>
+    <symbol id="i-window" viewBox="0 0 24 24">
+      <rect width="18" height="16" x="3" y="4" rx="2"/>
+      <line x1="3" x2="21" y1="9" y2="9"/>
+    </symbol>
+    <symbol id="i-refresh" viewBox="0 0 24 24">
+      <path d="M21 12a9 9 0 1 1-2.64-6.36"/>
+      <polyline points="21 3 21 9 15 9"/>
+    </symbol>
+    <symbol id="i-cast" viewBox="0 0 24 24">
+      <path d="M2 8V6a2 2 0 0 1 2-2h16a2 2 0 0 1 2 2v12a2 2 0 0 1-2 2h-6"/>
+      <path d="M2 12a9 9 0 0 1 8 8"/>
+      <path d="M2 16a5 5 0 0 1 4 4"/>
+      <line x1="2" x2="2.01" y1="20" y2="20"/>
+    </symbol>
+    <symbol id="i-volume" viewBox="0 0 24 24">
+      <path d="M11 4.702a.705.705 0 0 0-1.203-.498L6.413 7.587A1.4 1.4 0 0 1 5.416 8H3a1 1 0 0 0-1 1v6a1 1 0 0 0 1 1h2.416a1.4 1.4 0 0 1 .997.413l3.383 3.384A.705.705 0 0 0 11 19.298z"/>
+      <path d="M16 9a5 5 0 0 1 0 6"/>
+    </symbol>
+  </svg>
+
+  <div class="app-shell">
+    <header class="topbar">
+      <div class="topbar-left">
+        <span class="app-title">Eery</span>
+      </div>
+      <div class="topbar-right">
+        <span id="liveStatusPill" class="status-pill hidden"></span>
+      </div>
+    </header>
+
+    <main class="workspace">
+      <section class="stage-pane">
+        <div class="preview-box">
+          <video id="previewVideo" autoplay muted playsinline></video>
+          <div id="previewEmpty" class="preview-empty">
+            <svg class="ic ic-lg"><use href="#i-cast"/></svg>
+            <span>Selecione uma tela ou aplicativo</span>
+          </div>
+        </div>
+
+        <div class="picker-section">
+          <div class="picker-bar">
+            <div class="tab-group">
+              <button id="tabScreens" class="tab-btn active" type="button">
+                <svg class="ic ic-sm"><use href="#i-monitor"/></svg>
+                <span>Telas</span>
+              </button>
+              <button id="tabWindows" class="tab-btn" type="button">
+                <svg class="ic ic-sm"><use href="#i-window"/></svg>
+                <span>Aplicativos</span>
+              </button>
+            </div>
+            <button id="refreshSourcesBtn" class="btn-ghost" type="button" title="Atualizar fontes">
+              <svg class="ic ic-sm"><use href="#i-refresh"/></svg>
+              <span>Atualizar</span>
+            </button>
+          </div>
+
+          <div id="sourceGrid" class="source-grid"></div>
+        </div>
+      </section>
+
+      <aside class="sidebar">
+        <div class="panel-group">
+          <label class="field-label">Qualidade</label>
+          <div id="presetGrid" class="preset-grid"></div>
+        </div>
+
+        <div class="panel-group">
+          <label class="field-label" for="codecSelect">Desempenho</label>
+          <select id="codecSelect" class="discord-select">
+            <option value="auto">Automático (Placa de Vídeo)</option>
+            <option value="compatible">Compatível (Web / Activity)</option>
+            <option value="light">Modo Leve (Processador)</option>
+          </select>
+        </div>
+
+        <div class="panel-group">
+          <label class="toggle-row" for="audioToggle">
+            <span class="toggle-left">
+              <svg class="ic ic-sm"><use href="#i-volume"/></svg>
+              <span id="audioToggleLabel">Áudio da tela</span>
+            </span>
+            <input id="audioToggle" class="toggle-input" type="checkbox" checked>
+          </label>
+        </div>
+
+        <div class="panel-group">
+          <label class="field-label" for="wsUrlInput">Servidor</label>
+          <input id="wsUrlInput" class="discord-input" type="text" placeholder="wss://seu-servidor">
+          <label class="field-label field-label-spaced" for="streamKeyInput">Chave da sala</label>
+          <input id="streamKeyInput" class="discord-input" type="text" placeholder="sala_..._nav_...">
+        </div>
+
+        <div id="telemetryBox" class="telemetry-box hidden">
+          <div class="telemetry-cell">
+            <span class="telemetry-key">FPS</span>
+            <span id="statFps" class="telemetry-val">0</span>
+          </div>
+          <div class="telemetry-cell">
+            <span class="telemetry-key">Bitrate</span>
+            <span id="statBitrate" class="telemetry-val">0 kbps</span>
+          </div>
+        </div>
+
+        <div id="errorBanner" class="error-banner hidden"></div>
+
+        <div class="sidebar-footer">
+          <button id="streamBtn" class="btn-primary" type="button" disabled>Transmitir</button>
+        </div>
+      </aside>
+    </main>
+  </div>
+
+  <script type="module" src="./app.js"></script>
+</body>
+</html>
