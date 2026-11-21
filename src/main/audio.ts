@@ -1,6 +1,5 @@
 import { createRequire } from 'node:module';
-import { supportsProcessLoopbackAudio } from './win-version.js';
-import { resolvePidFromSourceId } from './windows-pid.js';
+import { resolveDiscordRootPid, resolvePidFromSourceId } from './windows-pid.js';
 
 const require = createRequire(import.meta.url);
 
@@ -20,6 +19,7 @@ interface LoopbackModule {
 export interface AudioStartResult {
   mode: 'app' | 'system' | 'none';
   pid?: number;
+  excludedPid?: number;
 }
 
 const MIN_SETTLE_MS = 250;
@@ -87,34 +87,15 @@ export class AppAudioCapturer {
       onChunk(new Uint8Array(chunk.buffer, chunk.byteOffset, chunk.byteLength));
     };
 
-    if (!supportsProcessLoopbackAudio()) {
-      const capture = new LoopbackCtor();
-      try {
-        capture.startSystemAudio(emitChunk);
-        if (mySeq !== this.sessionSeq) {
-          try {
-            capture.stop();
-          } catch {}
-          return { mode: 'none' };
-        }
-        this.instance = capture;
-        this.active = true;
-        this.startedAt = Date.now();
-        return { mode: 'system' };
-      } catch {
-        this.active = false;
-        this.instance = null;
-        return { mode: 'none' };
+    const isWindow = sourceId.startsWith('window:');
+    if (isWindow) {
+      let resolvedPid: number | null = knownPid && knownPid > 0 ? knownPid : null;
+      if (!resolvedPid) {
+        resolvedPid = await resolvePidFromSourceId(sourceId);
+        if (mySeq !== this.sessionSeq) return { mode: 'none' };
       }
-    }
+      if (!resolvedPid) return { mode: 'none' };
 
-    let resolvedPid: number | null = knownPid && knownPid > 0 ? knownPid : null;
-    if (!resolvedPid && sourceId.startsWith('window:')) {
-      resolvedPid = await resolvePidFromSourceId(sourceId);
-      if (mySeq !== this.sessionSeq) return { mode: 'none' };
-    }
-
-    if (resolvedPid) {
       const appCapture = new LoopbackCtor();
       try {
         appCapture.start(resolvedPid, emitChunk);
@@ -128,22 +109,46 @@ export class AppAudioCapturer {
         this.active = true;
         this.startedAt = Date.now();
         return { mode: 'app', pid: resolvedPid };
+      } catch {
+        this.active = false;
+        this.instance = null;
+        return { mode: 'none' };
+      }
+    }
+
+    const discordPid = await resolveDiscordRootPid();
+    if (mySeq !== this.sessionSeq) return { mode: 'none' };
+
+    if (discordPid) {
+      const excludeDiscordCapture = new LoopbackCtor();
+      try {
+        excludeDiscordCapture.startSystemAudio(emitChunk, discordPid);
+        if (mySeq !== this.sessionSeq) {
+          try {
+            excludeDiscordCapture.stop();
+          } catch {}
+          return { mode: 'none' };
+        }
+        this.instance = excludeDiscordCapture;
+        this.active = true;
+        this.startedAt = Date.now();
+        return { mode: 'system', excludedPid: discordPid };
       } catch {}
     }
 
-    const exclCapture = new LoopbackCtor();
+    const excludeSelfCapture = new LoopbackCtor();
     try {
-      exclCapture.startSystemAudio(emitChunk, process.pid);
+      excludeSelfCapture.startSystemAudio(emitChunk, process.pid);
       if (mySeq !== this.sessionSeq) {
         try {
-          exclCapture.stop();
+          excludeSelfCapture.stop();
         } catch {}
         return { mode: 'none' };
       }
-      this.instance = exclCapture;
+      this.instance = excludeSelfCapture;
       this.active = true;
       this.startedAt = Date.now();
-      return { mode: 'system' };
+      return { mode: 'system', excludedPid: process.pid };
     } catch {}
 
     const plainCapture = new LoopbackCtor();

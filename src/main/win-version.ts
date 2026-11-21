@@ -15,7 +15,7 @@ export function getWindowsBuildNumber(): number {
 }
 
 export function supportsProcessLoopbackAudio(): boolean {
-  return process.platform !== 'win32' || getWindowsBuildNumber() >= 20348;
+  return process.platform !== 'win32' || getWindowsBuildNumber() >= 19041;
 }
 
 export function shouldUseDxgiWindowCrop(): boolean {

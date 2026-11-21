@@ -38,6 +38,7 @@ export interface SystemCapabilities {
 export interface AudioCaptureInfo {
   mode: 'app' | 'system' | 'none';
   pid?: number;
+  excludedPid?: number;
 }
 
 export interface EeryDesktopApi {
