@@ -7,6 +7,7 @@ import {
   type ProbedCodec,
   type StreamPreset,
 } from '../shared/codecs.js';
+import type { CaptureMode, WindowCropBounds } from '../shared/ipc.js';
 
 export interface TelemetrySnapshot {
   fps: number;
@@ -17,12 +18,16 @@ export interface TransmitterOptions {
   wsUrl: string;
   streamKey: string;
   sourceId: string;
+  captureMode: CaptureMode;
+  initialBounds: WindowCropBounds | null;
   captureAudio: boolean;
   stream: MediaStream;
   probed: ProbedCodec;
   preset: StreamPreset;
   onStats: (stats: TelemetrySnapshot) => void;
   onStatusChange: (status: 'connecting' | 'live' | 'error' | 'stopped', detail?: string) => void;
+  onPreviewCanvasFrame?: (source: CanvasImageSource, width: number, height: number) => void;
+  onScreenMoved?: (screenSourceId: string) => Promise<MediaStream | null>;
 }
 
 export async function probeBestCodec(
@@ -77,8 +82,15 @@ export class LiveTransmitter {
   private videoEncoder: VideoEncoder | null = null;
   private audioEncoder: AudioEncoder | null = null;
   private videoReader: ReadableStreamDefaultReader<VideoFrame> | null = null;
+  private activeStream: MediaStream;
+  private currentBounds: WindowCropBounds | null;
+  private cropCanvas: OffscreenCanvas | null = null;
+  private cropCtx: OffscreenCanvasRenderingContext2D | null = null;
+  private unsubWindowBounds: (() => void) | null = null;
   private unsubAudioPcm: (() => void) | null = null;
   private statsTimer: number | null = null;
+  private activeReaderToken = 0;
+  private pendingScreenSwap: Promise<void> = Promise.resolve();
   private stopped = false;
   private forceNextKeyframe = true;
   private droppedVideoFrame = false;
@@ -92,6 +104,8 @@ export class LiveTransmitter {
 
   public constructor(options: TransmitterOptions) {
     this.options = options;
+    this.activeStream = options.stream;
+    this.currentBounds = options.initialBounds;
     this.codecInfoJson = JSON.stringify({
       type: 'codec_info',
       family: options.probed.candidate.family,
@@ -150,6 +164,10 @@ export class LiveTransmitter {
       }
     });
 
+    if (this.options.captureMode === 'dxgi-window') {
+      this.setupDxgiWindowCrop();
+    }
+
     this.announceCodec();
     this.startVideoPipeline();
     if (this.options.captureAudio) {
@@ -162,10 +180,16 @@ export class LiveTransmitter {
   public stop(finalStatus: 'stopped' | 'error' = 'stopped', detail?: string): void {
     if (this.stopped) return;
     this.stopped = true;
+    this.activeReaderToken += 1;
 
     if (this.statsTimer !== null) {
       window.clearInterval(this.statsTimer);
       this.statsTimer = null;
+    }
+
+    if (this.unsubWindowBounds) {
+      this.unsubWindowBounds();
+      this.unsubWindowBounds = null;
     }
 
     if (this.unsubAudioPcm) {
@@ -200,7 +224,63 @@ export class LiveTransmitter {
       this.ws = null;
     }
 
+    for (const track of this.activeStream.getTracks()) {
+      track.stop();
+    }
+    void window.eery.stopCapture();
+
+    this.cropCtx = null;
+    this.cropCanvas = null;
     this.options.onStatusChange(finalStatus, detail);
+  }
+
+  private setupDxgiWindowCrop(): void {
+    const { preset } = this.options;
+    const canvas = new OffscreenCanvas(preset.width, preset.height);
+    const ctx = canvas.getContext('2d', { alpha: false, desynchronized: true });
+    if (!ctx) throw new Error('Falha ao inicializar recorte de janela');
+    this.cropCanvas = canvas;
+    this.cropCtx = ctx;
+
+    this.unsubWindowBounds = window.eery.onWindowBounds((bounds) => {
+      if (this.stopped) return;
+      if (bounds.closed) {
+        this.stop('error', 'A janela selecionada foi fechada');
+        return;
+      }
+
+      const prevScreen = this.currentBounds?.screenSourceId;
+      this.currentBounds = bounds;
+      if (bounds.screenSourceId && prevScreen && bounds.screenSourceId !== prevScreen) {
+        this.queueScreenSwap(bounds.screenSourceId);
+      }
+    });
+  }
+
+  private queueScreenSwap(screenSourceId: string): void {
+    this.pendingScreenSwap = this.pendingScreenSwap.then(async () => {
+      if (this.stopped || !this.options.onScreenMoved || !this.videoEncoder) return;
+      const nextStream = await this.options.onScreenMoved(screenSourceId);
+      if (this.stopped || !nextStream || this.videoEncoder.state !== 'configured') {
+        nextStream?.getTracks().forEach((t) => t.stop());
+        return;
+      }
+
+      const oldStream = this.activeStream;
+      const oldReader = this.videoReader;
+      this.activeReaderToken += 1;
+      this.activeStream = nextStream;
+      this.forceNextKeyframe = true;
+
+      this.attachVideoTrack(nextStream, this.videoEncoder, this.options.preset);
+
+      if (oldReader) {
+        await oldReader.cancel().catch(() => undefined);
+      }
+      for (const track of oldStream.getTracks()) {
+        track.stop();
+      }
+    });
   }
 
   private announceCodec(): void {
@@ -240,9 +320,6 @@ export class LiveTransmitter {
   }
 
   private startVideoPipeline(): void {
-    const videoTrack = this.options.stream.getVideoTracks()[0];
-    if (!videoTrack) throw new Error('Nenhuma trilha de vídeo ativa');
-
     const { probed, preset } = this.options;
 
     const encoder = new VideoEncoder({
@@ -264,35 +341,51 @@ export class LiveTransmitter {
 
     encoder.configure(probed.config);
     this.videoEncoder = encoder;
+    this.attachVideoTrack(this.activeStream, encoder, preset);
+  }
+
+  private attachVideoTrack(
+    stream: MediaStream,
+    encoder: VideoEncoder,
+    preset: StreamPreset,
+  ): void {
+    const videoTrack = stream.getVideoTracks()[0];
+    if (!videoTrack) throw new Error('Nenhuma trilha de vídeo ativa');
 
     const processor = new MediaStreamTrackProcessor<VideoFrame>({ track: videoTrack });
     const reader = processor.readable.getReader();
     this.videoReader = reader;
+    const myToken = ++this.activeReaderToken;
 
     const pump = async () => {
-      while (!this.stopped) {
+      while (!this.stopped && this.activeReaderToken === myToken) {
         const { value: frame, done } = await reader.read();
-        if (done || !frame) break;
+        if (done || !frame) {
+          if (!this.stopped && this.activeReaderToken === myToken) {
+            this.stop('error', 'Captura de vídeo interrompida');
+          }
+          break;
+        }
 
         try {
           const socketOpen = Boolean(this.ws && this.ws.readyState === WebSocket.OPEN);
           const socketBackedUp = Boolean(this.ws && this.ws.bufferedAmount > 1_048_576);
           if (
-            socketOpen &&
-            !socketBackedUp &&
-            encoder.state === 'configured' &&
-            encoder.encodeQueueSize < 3
+            !socketOpen ||
+            socketBackedUp ||
+            encoder.state !== 'configured' ||
+            encoder.encodeQueueSize >= 3
           ) {
-            const keyFrame =
-              this.forceNextKeyframe ||
-              this.droppedVideoFrame ||
-              this.frameCounter % preset.keyframeInterval === 0;
-            this.forceNextKeyframe = false;
-            this.droppedVideoFrame = false;
+            this.droppedVideoFrame = true;
+            continue;
+          }
+
+          if (this.options.captureMode === 'dxgi-window') {
+            this.encodeCroppedFrame(frame, encoder, preset);
+          } else {
+            const keyFrame = this.nextKeyFrameFlag(preset);
             encoder.encode(frame, { keyFrame });
             this.frameCounter += 1;
-          } else {
-            this.droppedVideoFrame = true;
           }
         } finally {
           frame.close();
@@ -301,8 +394,66 @@ export class LiveTransmitter {
     };
 
     pump().catch(() => {
-      if (!this.stopped) this.stop('error', 'Captura de vídeo interrompida');
+      if (!this.stopped && this.activeReaderToken === myToken) {
+        this.stop('error', 'Captura de vídeo interrompida');
+      }
     });
+  }
+
+  private nextKeyFrameFlag(preset: StreamPreset): boolean {
+    const keyFrame =
+      this.forceNextKeyframe ||
+      this.droppedVideoFrame ||
+      this.frameCounter % preset.keyframeInterval === 0;
+    this.forceNextKeyframe = false;
+    this.droppedVideoFrame = false;
+    return keyFrame;
+  }
+
+  private encodeCroppedFrame(
+    frame: VideoFrame,
+    encoder: VideoEncoder,
+    preset: StreamPreset,
+  ): void {
+    const bounds = this.currentBounds;
+    const canvas = this.cropCanvas;
+    const ctx = this.cropCtx;
+    if (!bounds || bounds.minimized || !canvas || !ctx) return;
+
+    const frameW = frame.displayWidth || frame.codedWidth;
+    const frameH = frame.displayHeight || frame.codedHeight;
+    if (frameW <= 0 || frameH <= 0) return;
+
+    const sx = Math.max(0, Math.min(frameW - 1, Math.round(bounds.nx * frameW)));
+    const sy = Math.max(0, Math.min(frameH - 1, Math.round(bounds.ny * frameH)));
+    const sw = Math.max(1, Math.min(frameW - sx, Math.round(bounds.nw * frameW)));
+    const sh = Math.max(1, Math.min(frameH - sy, Math.round(bounds.nh * frameH)));
+
+    const cw = canvas.width;
+    const ch = canvas.height;
+    const scale = Math.min(cw / sw, ch / sh);
+    const dw = Math.max(1, Math.round(sw * scale));
+    const dh = Math.max(1, Math.round(sh * scale));
+    const dx = Math.floor((cw - dw) / 2);
+    const dy = Math.floor((ch - dh) / 2);
+
+    ctx.fillStyle = '#000000';
+    ctx.fillRect(0, 0, cw, ch);
+    ctx.drawImage(frame, sx, sy, sw, sh, dx, dy, dw, dh);
+
+    this.options.onPreviewCanvasFrame?.(canvas, cw, ch);
+
+    const croppedFrame = new VideoFrame(canvas, {
+      timestamp: frame.timestamp,
+      duration: frame.duration ?? undefined,
+    });
+    try {
+      const keyFrame = this.nextKeyFrameFlag(preset);
+      encoder.encode(croppedFrame, { keyFrame });
+      this.frameCounter += 1;
+    } finally {
+      croppedFrame.close();
+    }
   }
 
   private async startAudioPipeline(): Promise<void> {

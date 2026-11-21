@@ -1,4 +1,5 @@
 import { createRequire } from 'node:module';
+import { supportsProcessLoopbackAudio } from './win-version.js';
 import { resolvePidFromSourceId } from './windows-pid.js';
 
 const require = createRequire(import.meta.url);
@@ -81,34 +82,86 @@ export class AppAudioCapturer {
     const LoopbackCtor = getLoopbackConstructor();
     if (!LoopbackCtor) return { mode: 'none' };
 
+    const emitChunk = (chunk: Buffer) => {
+      if (!this.active || mySeq !== this.sessionSeq || chunk.byteLength === 0) return;
+      onChunk(new Uint8Array(chunk.buffer, chunk.byteOffset, chunk.byteLength));
+    };
+
+    if (!supportsProcessLoopbackAudio()) {
+      const capture = new LoopbackCtor();
+      try {
+        capture.startSystemAudio(emitChunk);
+        if (mySeq !== this.sessionSeq) {
+          try {
+            capture.stop();
+          } catch {}
+          return { mode: 'none' };
+        }
+        this.instance = capture;
+        this.active = true;
+        this.startedAt = Date.now();
+        return { mode: 'system' };
+      } catch {
+        this.active = false;
+        this.instance = null;
+        return { mode: 'none' };
+      }
+    }
+
     let resolvedPid: number | null = knownPid && knownPid > 0 ? knownPid : null;
     if (!resolvedPid && sourceId.startsWith('window:')) {
       resolvedPid = await resolvePidFromSourceId(sourceId);
       if (mySeq !== this.sessionSeq) return { mode: 'none' };
     }
 
-    const capture = new LoopbackCtor();
-    this.instance = capture;
-    this.active = true;
-    this.startedAt = Date.now();
-
-    const emitChunk = (chunk: Buffer) => {
-      if (!this.active || mySeq !== this.sessionSeq || chunk.byteLength === 0) return;
-      onChunk(new Uint8Array(chunk.buffer, chunk.byteOffset, chunk.byteLength));
-    };
-
     if (resolvedPid) {
+      const appCapture = new LoopbackCtor();
       try {
-        capture.start(resolvedPid, emitChunk);
+        appCapture.start(resolvedPid, emitChunk);
+        if (mySeq !== this.sessionSeq) {
+          try {
+            appCapture.stop();
+          } catch {}
+          return { mode: 'none' };
+        }
+        this.instance = appCapture;
+        this.active = true;
+        this.startedAt = Date.now();
         return { mode: 'app', pid: resolvedPid };
       } catch {}
     }
 
+    const exclCapture = new LoopbackCtor();
     try {
-      capture.startSystemAudio(emitChunk, process.pid);
+      exclCapture.startSystemAudio(emitChunk, process.pid);
+      if (mySeq !== this.sessionSeq) {
+        try {
+          exclCapture.stop();
+        } catch {}
+        return { mode: 'none' };
+      }
+      this.instance = exclCapture;
+      this.active = true;
+      this.startedAt = Date.now();
+      return { mode: 'system' };
+    } catch {}
+
+    const plainCapture = new LoopbackCtor();
+    try {
+      plainCapture.startSystemAudio(emitChunk);
+      if (mySeq !== this.sessionSeq) {
+        try {
+          plainCapture.stop();
+        } catch {}
+        return { mode: 'none' };
+      }
+      this.instance = plainCapture;
+      this.active = true;
+      this.startedAt = Date.now();
       return { mode: 'system' };
     } catch {
-      this.stop();
+      this.active = false;
+      this.instance = null;
       return { mode: 'none' };
     }
   }

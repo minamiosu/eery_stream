@@ -6,8 +6,15 @@ import {
   type GpuInfo,
   type PresetId,
   type ProbedCodec,
+  type StreamPreset,
 } from '../shared/codecs.js';
-import type { CaptureSourceItem, EeryDesktopApi, SourceKind } from '../shared/ipc.js';
+import type {
+  CaptureMode,
+  CaptureSourceItem,
+  EeryDesktopApi,
+  SourceKind,
+  SystemCapabilities,
+} from '../shared/ipc.js';
 import { LiveTransmitter, normalizeWsUrl, probeBestCodec, type TelemetrySnapshot } from './encoder.js';
 
 declare global {
@@ -20,9 +27,12 @@ const STORAGE_WS_KEY = 'eery_ws_url';
 const STORAGE_STREAM_KEY = 'eery_stream_key';
 const STORAGE_PRESET_KEY = 'eery_preset_id';
 const STORAGE_CODEC_KEY = 'eery_codec_mode';
+const PREVIEW_CANVAS_MIN_INTERVAL_MS = 50;
 
 const liveStatusPill = document.getElementById('liveStatusPill') as HTMLSpanElement;
+const previewThumb = document.getElementById('previewThumb') as HTMLImageElement;
 const previewVideo = document.getElementById('previewVideo') as HTMLVideoElement;
+const previewCanvas = document.getElementById('previewCanvas') as HTMLCanvasElement;
 const previewEmpty = document.getElementById('previewEmpty') as HTMLDivElement;
 const tabScreens = document.getElementById('tabScreens') as HTMLButtonElement;
 const tabWindows = document.getElementById('tabWindows') as HTMLButtonElement;
@@ -39,11 +49,18 @@ const statFps = document.getElementById('statFps') as HTMLSpanElement;
 const statBitrate = document.getElementById('statBitrate') as HTMLSpanElement;
 const errorBanner = document.getElementById('errorBanner') as HTMLDivElement;
 const streamBtn = document.getElementById('streamBtn') as HTMLButtonElement;
+const previewCanvasCtx = previewCanvas.getContext('2d');
 
 let gpuInfo: GpuInfo = {
   vendor: 'software',
   supportsHardwareAv1: false,
   supportsHardwareHevc: false,
+};
+
+let capabilities: SystemCapabilities = {
+  windowsBuild: 0,
+  supportsAppAudio: false,
+  dxgiWindowCrop: false,
 };
 
 const rawStoredMode = localStorage.getItem(STORAGE_CODEC_KEY);
@@ -54,15 +71,18 @@ let selectedCodecMode: CodecMode =
 
 let activeKind: SourceKind = 'screen';
 let allSources: CaptureSourceItem[] = [];
+const loadedKinds = new Set<SourceKind>();
 let selectedSource: CaptureSourceItem | null = null;
-let selectedPresetId: PresetId = (localStorage.getItem(STORAGE_PRESET_KEY) as PresetId) || 'fluid_720p60';
+let selectedPresetId: PresetId =
+  (localStorage.getItem(STORAGE_PRESET_KEY) as PresetId) || 'fluid_720p60';
 let activeProbedCodec: ProbedCodec | null = null;
-let previewStream: MediaStream | null = null;
+let activeStream: MediaStream | null = null;
 let transmitter: LiveTransmitter | null = null;
 let isLive = false;
+let isStarting = false;
 let liveStartedAt = 0;
 let liveClockTimer: number | null = null;
-let previewSeq = 0;
+let lastPreviewDrawAt = 0;
 let liveLabelEl: HTMLSpanElement | null = null;
 const presetButtons = new Map<PresetId, HTMLButtonElement>();
 const sourceCards = new Map<string, HTMLButtonElement>();
@@ -110,34 +130,47 @@ function updateLivePill(state: 'idle' | 'connecting' | 'live'): void {
 }
 
 function updateAudioLabel(): void {
-  audioToggleLabel.textContent =
-    selectedSource?.kind === 'window' ? 'Áudio do aplicativo' : 'Áudio da tela';
+  if (selectedSource?.kind === 'window') {
+    audioToggleLabel.textContent = capabilities.supportsAppAudio
+      ? 'Áudio do aplicativo'
+      : 'Áudio do sistema';
+    return;
+  }
+  audioToggleLabel.textContent = 'Áudio da tela';
+}
+
+function syncPreviewDisplay(mode: 'empty' | 'thumb' | 'video' | 'canvas'): void {
+  previewEmpty.classList.toggle('hidden', mode !== 'empty');
+  previewThumb.classList.toggle('hidden', mode !== 'thumb');
+  previewVideo.classList.toggle('hidden', mode !== 'video');
+  previewCanvas.classList.toggle('hidden', mode !== 'canvas');
+
+  if (mode === 'thumb' && selectedSource) {
+    previewThumb.src = selectedSource.thumbnailDataUrl;
+    previewThumb.alt = selectedSource.appName || selectedSource.name;
+  } else if (mode !== 'thumb') {
+    previewThumb.removeAttribute('src');
+  }
+}
+
+function drawPreviewCanvas(source: CanvasImageSource, width: number, height: number): void {
+  if (!previewCanvasCtx || document.hidden) return;
+  const now = performance.now();
+  if (now - lastPreviewDrawAt < PREVIEW_CANVAS_MIN_INTERVAL_MS) return;
+  lastPreviewDrawAt = now;
+
+  if (previewCanvas.width !== width || previewCanvas.height !== height) {
+    previewCanvas.width = width;
+    previewCanvas.height = height;
+  }
+  previewCanvasCtx.drawImage(source, 0, 0, width, height);
 }
 
 function syncPresetButtons(): void {
+  const busy = isLive || isStarting;
   for (const [presetId, btn] of presetButtons) {
     btn.classList.toggle('active', presetId === selectedPresetId);
-    btn.disabled = isLive;
-  }
-}
-
-async function applyPresetToActivePreview(): Promise<void> {
-  if (!selectedSource) return;
-  const videoTrack = previewStream?.getVideoTracks()[0];
-  if (!videoTrack || videoTrack.readyState !== 'live') {
-    await startPreviewForSource(selectedSource);
-    return;
-  }
-  const preset = getPresetById(selectedPresetId);
-  videoTrack.contentHint = preset.framerate >= 60 ? 'motion' : 'detail';
-  try {
-    await videoTrack.applyConstraints({
-      width: { ideal: preset.width, max: preset.width },
-      height: { ideal: preset.height, max: preset.height },
-      frameRate: { ideal: preset.framerate, max: preset.framerate },
-    });
-  } catch {
-    await startPreviewForSource(selectedSource);
+    btn.disabled = busy;
   }
 }
 
@@ -159,11 +192,11 @@ function mountPresets(): void {
 
     btn.append(main, sub);
     btn.addEventListener('click', () => {
-      if (isLive || selectedPresetId === preset.id) return;
+      if (isLive || isStarting || selectedPresetId === preset.id) return;
       selectedPresetId = preset.id;
       localStorage.setItem(STORAGE_PRESET_KEY, selectedPresetId);
       syncPresetButtons();
-      void refreshCodecProbe().then(() => applyPresetToActivePreview());
+      void refreshCodecProbe();
     });
     presetButtons.set(preset.id, btn);
     presetGrid.appendChild(btn);
@@ -172,9 +205,21 @@ function mountPresets(): void {
 }
 
 function syncSelectedSourceCard(): void {
+  const busy = isLive || isStarting;
   for (const [id, card] of sourceCards) {
     card.classList.toggle('selected', selectedSource?.id === id);
+    card.disabled = busy;
   }
+}
+
+function selectSourceCard(source: CaptureSourceItem): void {
+  if (isLive || isStarting) return;
+  showError('');
+  selectedSource = source;
+  updateAudioLabel();
+  syncSelectedSourceCard();
+  syncPreviewDisplay('thumb');
+  syncButtonsState();
 }
 
 function renderSources(): void {
@@ -196,6 +241,7 @@ function renderSources(): void {
     card.type = 'button';
     card.className = `source-card${selectedSource?.id === src.id ? ' selected' : ''}`;
     card.dataset.sourceId = src.id;
+    card.disabled = isLive || isStarting;
 
     const thumbWrap = document.createElement('div');
     thumbWrap.className = 'source-thumb-wrap';
@@ -236,81 +282,10 @@ function renderSources(): void {
     labelRow.appendChild(textBox);
     card.append(thumbWrap, labelRow);
     card.addEventListener('click', () => {
-      if (isLive) return;
-      void startPreviewForSource(src);
+      selectSourceCard(src);
     });
     sourceCards.set(src.id, card);
     sourceGrid.appendChild(card);
-  }
-}
-
-function updatePreviewState(): void {
-  previewEmpty.classList.toggle('hidden', Boolean(selectedSource && previewStream));
-}
-
-function stopPreviewStream(): void {
-  if (previewStream) {
-    for (const track of previewStream.getTracks()) {
-      track.stop();
-    }
-    previewStream = null;
-  }
-  previewVideo.srcObject = null;
-  updatePreviewState();
-}
-
-async function startPreviewForSource(source: CaptureSourceItem): Promise<void> {
-  const seq = ++previewSeq;
-  showError('');
-  selectedSource = source;
-  updateAudioLabel();
-  syncSelectedSourceCard();
-  stopPreviewStream();
-
-  const preset = getPresetById(selectedPresetId);
-  await window.eery.selectSource(source.id);
-  if (seq !== previewSeq) return;
-
-  try {
-    const stream = await navigator.mediaDevices.getDisplayMedia({
-      video: {
-        width: { ideal: preset.width, max: preset.width },
-        height: { ideal: preset.height, max: preset.height },
-        frameRate: { ideal: preset.framerate, max: preset.framerate },
-      },
-      audio: false,
-    });
-
-    if (seq !== previewSeq) {
-      for (const track of stream.getTracks()) track.stop();
-      return;
-    }
-
-    previewStream = stream;
-    previewVideo.srcObject = stream;
-    await previewVideo.play().catch(() => undefined);
-
-    const videoTrack = stream.getVideoTracks()[0];
-    if (videoTrack) {
-      videoTrack.contentHint = preset.framerate >= 60 ? 'motion' : 'detail';
-      videoTrack.addEventListener('ended', () => {
-        if (previewStream !== stream) return;
-        if (isLive) stopTransmission();
-        stopPreviewStream();
-        selectedSource = null;
-        updateAudioLabel();
-        syncSelectedSourceCard();
-        syncButtonsState();
-      });
-    }
-
-    updatePreviewState();
-    syncButtonsState();
-  } catch (err) {
-    if (seq !== previewSeq) return;
-    const msg = err instanceof Error ? err.message : 'Falha ao capturar fonte selecionada';
-    showError(msg);
-    syncButtonsState();
   }
 }
 
@@ -321,22 +296,29 @@ async function refreshCodecProbe(): Promise<void> {
 }
 
 function syncButtonsState(): void {
+  const busy = isLive || isStarting;
   const canStart = Boolean(
-    previewStream &&
-      selectedSource &&
+    selectedSource &&
       activeProbedCodec &&
       wsUrlInput.value.trim() &&
       streamKeyInput.value.trim(),
   );
 
-  streamBtn.disabled = isLive ? false : !canStart;
-  streamBtn.textContent = isLive ? 'Parar transmissão' : 'Transmitir';
+  streamBtn.disabled = isStarting ? true : isLive ? false : !canStart;
+  streamBtn.textContent = isLive
+    ? 'Parar transmissão'
+    : isStarting
+      ? 'Iniciando...'
+      : 'Transmitir';
   streamBtn.classList.toggle('live', isLive);
-  codecSelect.disabled = isLive;
-  audioToggle.disabled = isLive;
-  wsUrlInput.disabled = isLive;
-  streamKeyInput.disabled = isLive;
-  refreshSourcesBtn.disabled = isLive;
+  codecSelect.disabled = busy;
+  audioToggle.disabled = busy;
+  wsUrlInput.disabled = busy;
+  streamKeyInput.disabled = busy;
+  refreshSourcesBtn.disabled = busy;
+  tabScreens.disabled = busy;
+  tabWindows.disabled = busy;
+  syncSelectedSourceCard();
   syncPresetButtons();
 }
 
@@ -345,8 +327,66 @@ function updateStatsView(stats: TelemetrySnapshot): void {
   statBitrate.textContent = `${stats.bitrateKbps} kbps`;
 }
 
+function cleanupStreamResources(): void {
+  if (activeStream) {
+    for (const track of activeStream.getTracks()) {
+      track.stop();
+    }
+    activeStream = null;
+  }
+  previewVideo.srcObject = null;
+  if (previewCanvasCtx && previewCanvas.width > 0 && previewCanvas.height > 0) {
+    previewCanvasCtx.clearRect(0, 0, previewCanvas.width, previewCanvas.height);
+  }
+  void window.eery.stopCapture();
+}
+
+async function acquireDisplayStream(
+  captureMode: CaptureMode,
+  preset: StreamPreset,
+): Promise<MediaStream> {
+  const videoConstraints: MediaTrackConstraints =
+    captureMode === 'dxgi-window'
+      ? {
+          width: { max: 3840 },
+          height: { max: 2160 },
+          frameRate: { ideal: preset.framerate, max: preset.framerate },
+        }
+      : {
+          width: { ideal: preset.width, max: preset.width },
+          height: { ideal: preset.height, max: preset.height },
+          frameRate: { ideal: preset.framerate, max: preset.framerate },
+        };
+
+  const stream = await navigator.mediaDevices.getDisplayMedia({
+    video: videoConstraints,
+    audio: false,
+  });
+
+  const videoTrack = stream.getVideoTracks()[0];
+  if (videoTrack) {
+    videoTrack.contentHint = preset.framerate >= 60 ? 'motion' : 'detail';
+  }
+  return stream;
+}
+
+function bindTrackEnded(stream: MediaStream): void {
+  const track = stream.getVideoTracks()[0];
+  if (!track) return;
+  track.addEventListener('ended', () => {
+    if (activeStream !== stream) return;
+    if (transmitter) {
+      transmitter.stop('error', 'Captura de vídeo encerrada');
+    } else {
+      cleanupStreamResources();
+      syncPreviewDisplay(selectedSource ? 'thumb' : 'empty');
+      syncButtonsState();
+    }
+  });
+}
+
 async function startTransmission(): Promise<void> {
-  if (!previewStream || !selectedSource || !activeProbedCodec) return;
+  if (!selectedSource || !activeProbedCodec || isLive || isStarting) return;
 
   const rawUrl = wsUrlInput.value.trim();
   const wsUrl = normalizeWsUrl(rawUrl);
@@ -362,61 +402,154 @@ async function startTransmission(): Promise<void> {
   showError('');
 
   const preset = getPresetById(selectedPresetId);
-  isLive = true;
-  liveStartedAt = Date.now();
+  const targetSource = selectedSource;
+  const probed = activeProbedCodec;
+
+  isStarting = true;
+  updateLivePill('connecting');
   syncButtonsState();
 
-  liveClockTimer = window.setInterval(() => {
-    if (isLive) updateLivePill('live');
-  }, 1000);
-
-  transmitter = new LiveTransmitter({
-    wsUrl,
-    streamKey,
-    sourceId: selectedSource.id,
-    captureAudio: audioToggle.checked,
-    stream: previewStream,
-    probed: activeProbedCodec,
-    preset,
-    onStats: updateStatsView,
-    onStatusChange: (status, detail) => {
-      if (status === 'connecting') {
-        updateLivePill('connecting');
-      } else if (status === 'live') {
-        telemetryBox.classList.remove('hidden');
-        updateLivePill('live');
-      } else {
-        isLive = false;
-        if (liveClockTimer !== null) {
-          window.clearInterval(liveClockTimer);
-          liveClockTimer = null;
-        }
-        telemetryBox.classList.add('hidden');
-        updateLivePill('idle');
-        if (status === 'error' && detail) showError(detail);
-        syncButtonsState();
-      }
-    },
-  });
-
   try {
-    await transmitter.start();
+    const prepared = await window.eery.prepareCapture(targetSource.id);
+    const stream = await acquireDisplayStream(prepared.captureMode, preset);
+
+    if (!isStarting) {
+      for (const track of stream.getTracks()) track.stop();
+      void window.eery.stopCapture();
+      return;
+    }
+
+    activeStream = stream;
+    bindTrackEnded(stream);
+
+    if (prepared.captureMode === 'dxgi-window') {
+      previewVideo.srcObject = null;
+      lastPreviewDrawAt = 0;
+      syncPreviewDisplay('canvas');
+    } else {
+      previewVideo.srcObject = stream;
+      await previewVideo.play().catch(() => undefined);
+      syncPreviewDisplay('video');
+    }
+
+    isStarting = false;
+    isLive = true;
+    liveStartedAt = Date.now();
+    syncButtonsState();
+
+    liveClockTimer = window.setInterval(() => {
+      if (isLive) updateLivePill('live');
+    }, 1000);
+
+    const tx = new LiveTransmitter({
+      wsUrl,
+      streamKey,
+      sourceId: targetSource.id,
+      captureMode: prepared.captureMode,
+      initialBounds: prepared.initialBounds,
+      captureAudio: audioToggle.checked,
+      stream,
+      probed,
+      preset,
+      onStats: updateStatsView,
+      onPreviewCanvasFrame:
+        prepared.captureMode === 'dxgi-window' ? drawPreviewCanvas : undefined,
+      onScreenMoved:
+        prepared.captureMode === 'dxgi-window'
+          ? async (screenSourceId) => {
+              await window.eery.switchScreenSource(screenSourceId);
+              const nextStream = await acquireDisplayStream('dxgi-window', preset);
+              if (!isLive || transmitter !== tx) {
+                for (const track of nextStream.getTracks()) track.stop();
+                return null;
+              }
+              activeStream = nextStream;
+              bindTrackEnded(nextStream);
+              return nextStream;
+            }
+          : undefined,
+      onStatusChange: (status, detail) => {
+        if (status === 'connecting') {
+          updateLivePill('connecting');
+        } else if (status === 'live') {
+          telemetryBox.classList.remove('hidden');
+          updateLivePill('live');
+        } else {
+          isLive = false;
+          isStarting = false;
+          if (transmitter === tx) {
+            transmitter = null;
+          }
+          if (liveClockTimer !== null) {
+            window.clearInterval(liveClockTimer);
+            liveClockTimer = null;
+          }
+          cleanupStreamResources();
+          syncPreviewDisplay(selectedSource ? 'thumb' : 'empty');
+          telemetryBox.classList.add('hidden');
+          updateLivePill('idle');
+          if (status === 'error' && detail) showError(detail);
+          syncButtonsState();
+        }
+      },
+    });
+
+    transmitter = tx;
+    await tx.start();
   } catch (err) {
+    isStarting = false;
+    isLive = false;
+    if (liveClockTimer !== null) {
+      window.clearInterval(liveClockTimer);
+      liveClockTimer = null;
+    }
+    if (transmitter) {
+      const activeTx = transmitter;
+      transmitter = null;
+      activeTx.stop('stopped');
+    } else {
+      cleanupStreamResources();
+    }
+    syncPreviewDisplay(selectedSource ? 'thumb' : 'empty');
+    updateLivePill('idle');
     const msg = err instanceof Error ? err.message : 'Erro ao iniciar transmissão';
-    transmitter.stop('error', msg);
+    showError(msg);
+    syncButtonsState();
   }
 }
 
 function stopTransmission(): void {
   if (transmitter) {
-    transmitter.stop('stopped');
+    const activeTx = transmitter;
     transmitter = null;
+    activeTx.stop('stopped');
+    return;
+  }
+  if (isStarting) {
+    isStarting = false;
+    cleanupStreamResources();
+    syncPreviewDisplay(selectedSource ? 'thumb' : 'empty');
+    updateLivePill('idle');
+    syncButtonsState();
   }
 }
 
-async function refreshSources(): Promise<void> {
-  allSources = await window.eery.listSources();
+async function refreshSources(kind: SourceKind = activeKind): Promise<void> {
+  const fetched = await window.eery.listSources(kind);
+  loadedKinds.add(kind);
+  allSources = [...allSources.filter((s) => s.kind !== kind), ...fetched];
+
+  if (selectedSource && selectedSource.kind === kind) {
+    const updated = fetched.find((s) => s.id === selectedSource?.id) ?? null;
+    selectedSource = updated;
+    if (!isLive && !isStarting) {
+      syncPreviewDisplay(selectedSource ? 'thumb' : 'empty');
+    }
+  }
+
   renderSources();
+  updateAudioLabel();
+  syncButtonsState();
 }
 
 function applyDeepLink(target: DeepLinkTarget | null): void {
@@ -433,27 +566,41 @@ async function init(): Promise<void> {
   streamKeyInput.value = localStorage.getItem(STORAGE_STREAM_KEY) || '';
   codecSelect.value = selectedCodecMode;
 
-  gpuInfo = await window.eery.getGpuInfo();
+  const [gpu, caps] = await Promise.all([
+    window.eery.getGpuInfo(),
+    window.eery.getCapabilities(),
+  ]);
+  gpuInfo = gpu;
+  capabilities = caps;
 
   applyDeepLink(await window.eery.getLaunchTarget());
   window.eery.onLaunchTarget(applyDeepLink);
 
   tabScreens.addEventListener('click', () => {
+    if (isLive || isStarting) return;
     activeKind = 'screen';
     tabScreens.classList.add('active');
     tabWindows.classList.remove('active');
     renderSources();
+    if (!loadedKinds.has('screen')) {
+      void refreshSources('screen');
+    }
   });
 
   tabWindows.addEventListener('click', () => {
+    if (isLive || isStarting) return;
     activeKind = 'window';
     tabWindows.classList.add('active');
     tabScreens.classList.remove('active');
     renderSources();
+    if (!loadedKinds.has('window')) {
+      void refreshSources('window');
+    }
   });
 
   refreshSourcesBtn.addEventListener('click', () => {
-    void refreshSources();
+    if (isLive || isStarting) return;
+    void refreshSources(activeKind);
   });
 
   codecSelect.addEventListener('change', () => {
@@ -463,7 +610,7 @@ async function init(): Promise<void> {
   });
 
   const submitOnEnter = (ev: KeyboardEvent) => {
-    if (ev.key === 'Enter' && !isLive && !streamBtn.disabled) {
+    if (ev.key === 'Enter' && !isLive && !isStarting && !streamBtn.disabled) {
       void startTransmission();
     }
   };
@@ -474,13 +621,24 @@ async function init(): Promise<void> {
   streamKeyInput.addEventListener('keydown', submitOnEnter);
 
   streamBtn.addEventListener('click', () => {
-    if (isLive) stopTransmission();
+    if (isLive || isStarting) stopTransmission();
     else void startTransmission();
   });
 
+  window.addEventListener('beforeunload', () => {
+    if (transmitter) {
+      const activeTx = transmitter;
+      transmitter = null;
+      activeTx.stop('stopped');
+    } else {
+      cleanupStreamResources();
+    }
+  });
+
+  syncPreviewDisplay('empty');
   updateAudioLabel();
   mountPresets();
-  await Promise.all([refreshCodecProbe(), refreshSources()]);
+  await Promise.all([refreshCodecProbe(), refreshSources('screen')]);
   syncButtonsState();
 }
 

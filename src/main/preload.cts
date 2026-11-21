@@ -2,8 +2,19 @@ import { contextBridge, ipcRenderer } from 'electron';
 
 const api = {
   getGpuInfo: () => ipcRenderer.invoke('eery:gpu-info'),
-  listSources: () => ipcRenderer.invoke('eery:list-sources'),
-  selectSource: (sourceId: string) => ipcRenderer.invoke('eery:select-source', sourceId),
+  getCapabilities: () => ipcRenderer.invoke('eery:capabilities'),
+  listSources: (kind?: 'screen' | 'window') => ipcRenderer.invoke('eery:list-sources', kind),
+  prepareCapture: (sourceId: string) => ipcRenderer.invoke('eery:prepare-capture', sourceId),
+  stopCapture: () => ipcRenderer.invoke('eery:stop-capture'),
+  switchScreenSource: (screenSourceId: string) =>
+    ipcRenderer.invoke('eery:switch-screen-source', screenSourceId),
+  onWindowBounds: (listener: (bounds: unknown) => void) => {
+    const wrapped = (_event: Electron.IpcRendererEvent, bounds: unknown) => {
+      listener(bounds);
+    };
+    ipcRenderer.on('eery:window-bounds', wrapped);
+    return () => ipcRenderer.removeListener('eery:window-bounds', wrapped);
+  },
   startAudioCapture: (sourceId: string) => ipcRenderer.invoke('eery:audio-start', sourceId),
   stopAudioCapture: () => ipcRenderer.invoke('eery:audio-stop'),
   onAudioPcm: (listener: (pcm: Uint8Array) => void) => {
@@ -15,7 +26,10 @@ const api = {
   },
   getLaunchTarget: () => ipcRenderer.invoke('eery:launch-target'),
   onLaunchTarget: (listener: (target: { wsUrl: string; streamKey: string }) => void) => {
-    const wrapped = (_event: Electron.IpcRendererEvent, payload: { wsUrl: string; streamKey: string }) => {
+    const wrapped = (
+      _event: Electron.IpcRendererEvent,
+      payload: { wsUrl: string; streamKey: string },
+    ) => {
       listener(payload);
     };
     ipcRenderer.on('eery:deep-link', wrapped);
