@@ -3,20 +3,10 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { parseDeepLinkUrl, type DeepLinkTarget, type GpuInfo } from '../shared/codecs.js';
-import type {
-  CaptureSourceItem,
-  PreparedCapture,
-  SourceKind,
-  SystemCapabilities,
-} from '../shared/ipc.js';
+import type { CaptureSourceItem, SourceKind, SystemCapabilities } from '../shared/ipc.js';
 import { AppAudioCapturer } from './audio.js';
 import { detectSystemGpu } from './gpu.js';
-import {
-  getWindowsBuildNumber,
-  shouldUseDxgiWindowCrop,
-  supportsProcessLoopbackAudio,
-} from './win-version.js';
-import { WindowBoundsTracker } from './window-tracker.js';
+import { getWindowsBuildNumber, supportsProcessLoopbackAudio } from './win-version.js';
 import { extractHwndFromSourceId, resolveWindowsMetadata } from './windows-pid.js';
 
 const __filename = fileURLToPath(import.meta.url);
@@ -24,7 +14,7 @@ const __dirname = path.dirname(__filename);
 
 app.commandLine.appendSwitch(
   'disable-features',
-  'WebRtcAllowWgcUsingTexture,ZeroCopyDesktopCapture',
+  'AllowWgcWindowCapturer,AllowWgcScreenCapturer,AllowWgcWindowZeroHz,AllowWgcScreenZeroHz,WebRtcAllowWgcUsingTexture,ZeroCopyDesktopCapture',
 );
 
 let mainWindow: BrowserWindow | null = null;
@@ -33,7 +23,6 @@ let selectedCaptureSourceId = '';
 let pendingLaunchTarget: DeepLinkTarget | null = null;
 const cachedWindowPids = new Map<string, number>();
 const audioCapturer = new AppAudioCapturer();
-const windowTracker = new WindowBoundsTracker();
 
 function extractDeepLink(argv: readonly string[]): DeepLinkTarget | null {
   for (const arg of argv) {
@@ -64,11 +53,6 @@ function registerProtocolClient(): void {
   }
 }
 
-function stopAllCaptures(): void {
-  windowTracker.stop();
-  audioCapturer.stop();
-}
-
 function createWindow(): void {
   mainWindow = new BrowserWindow({
     width: 960,
@@ -93,7 +77,7 @@ function createWindow(): void {
   });
   mainWindow.loadFile(path.resolve(__dirname, '../renderer/index.html'));
   mainWindow.on('closed', () => {
-    stopAllCaptures();
+    audioCapturer.stop();
     mainWindow = null;
   });
 }
@@ -101,6 +85,10 @@ function createWindow(): void {
 function registerHandlers(): void {
   session.defaultSession.setDisplayMediaRequestHandler(async (_request, callback) => {
     try {
+      if (!selectedCaptureSourceId) {
+        callback({});
+        return;
+      }
       const requestType: SourceKind = selectedCaptureSourceId.startsWith('window:')
         ? 'window'
         : 'screen';
@@ -108,7 +96,7 @@ function registerHandlers(): void {
         types: [requestType],
         thumbnailSize: { width: 0, height: 0 },
       });
-      const chosen = sources.find((s) => s.id === selectedCaptureSourceId) ?? sources[0];
+      const chosen = sources.find((s) => s.id === selectedCaptureSourceId);
       if (!chosen) {
         callback({});
         return;
@@ -130,7 +118,6 @@ function registerHandlers(): void {
     return {
       windowsBuild: getWindowsBuildNumber(),
       supportsAppAudio: supportsProcessLoopbackAudio(),
-      dxgiWindowCrop: shouldUseDxgiWindowCrop(),
     };
   });
 
@@ -183,52 +170,12 @@ function registerHandlers(): void {
     },
   );
 
-  ipcMain.handle(
-    'eery:prepare-capture',
-    async (_event, sourceId: string): Promise<PreparedCapture> => {
-      const targetId = typeof sourceId === 'string' ? sourceId : '';
-      windowTracker.stop();
-
-      if (targetId.startsWith('window:') && shouldUseDxgiWindowCrop()) {
-        const hwnd = extractHwndFromSourceId(targetId);
-        if (!hwnd) {
-          throw new Error('Janela selecionada inválida');
-        }
-
-        const initialBounds = await windowTracker.start(hwnd, (bounds) => {
-          if (mainWindow && !mainWindow.isDestroyed()) {
-            mainWindow.webContents.send('eery:window-bounds', bounds);
-          }
-        });
-
-        if (initialBounds.closed) {
-          windowTracker.stop();
-          throw new Error('A janela selecionada foi fechada');
-        }
-
-        selectedCaptureSourceId = initialBounds.screenSourceId;
-        return {
-          captureMode: 'dxgi-window',
-          captureSourceId: initialBounds.screenSourceId,
-          initialBounds,
-        };
-      }
-
-      selectedCaptureSourceId = targetId;
-      return {
-        captureMode: 'direct',
-        captureSourceId: targetId,
-        initialBounds: null,
-      };
-    },
-  );
-
-  ipcMain.handle('eery:switch-screen-source', (_event, screenSourceId: string) => {
-    selectedCaptureSourceId = typeof screenSourceId === 'string' ? screenSourceId : '';
+  ipcMain.handle('eery:prepare-capture', (_event, sourceId: string) => {
+    selectedCaptureSourceId = typeof sourceId === 'string' ? sourceId : '';
   });
 
   ipcMain.handle('eery:stop-capture', () => {
-    stopAllCaptures();
+    audioCapturer.stop();
   });
 
   ipcMain.handle('eery:audio-start', async (_event, sourceId: string) => {
@@ -278,11 +225,11 @@ if (!singleLock) {
   });
 
   app.on('before-quit', () => {
-    stopAllCaptures();
+    audioCapturer.stop();
   });
 
   app.on('window-all-closed', () => {
-    stopAllCaptures();
+    audioCapturer.stop();
     if (process.platform !== 'darwin') app.quit();
   });
 }

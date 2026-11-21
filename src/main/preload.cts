@@ -6,15 +6,6 @@ const api = {
   listSources: (kind?: 'screen' | 'window') => ipcRenderer.invoke('eery:list-sources', kind),
   prepareCapture: (sourceId: string) => ipcRenderer.invoke('eery:prepare-capture', sourceId),
   stopCapture: () => ipcRenderer.invoke('eery:stop-capture'),
-  switchScreenSource: (screenSourceId: string) =>
-    ipcRenderer.invoke('eery:switch-screen-source', screenSourceId),
-  onWindowBounds: (listener: (bounds: unknown) => void) => {
-    const wrapped = (_event: Electron.IpcRendererEvent, bounds: unknown) => {
-      listener(bounds);
-    };
-    ipcRenderer.on('eery:window-bounds', wrapped);
-    return () => ipcRenderer.removeListener('eery:window-bounds', wrapped);
-  },
   startAudioCapture: (sourceId: string) => ipcRenderer.invoke('eery:audio-start', sourceId),
   stopAudioCapture: () => ipcRenderer.invoke('eery:audio-stop'),
   onAudioPcm: (listener: (pcm: Uint8Array) => void) => {

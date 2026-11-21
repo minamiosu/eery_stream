@@ -9,7 +9,6 @@ import {
   type StreamPreset,
 } from '../shared/codecs.js';
 import type {
-  CaptureMode,
   CaptureSourceItem,
   EeryDesktopApi,
   SourceKind,
@@ -27,12 +26,10 @@ const STORAGE_WS_KEY = 'eery_ws_url';
 const STORAGE_STREAM_KEY = 'eery_stream_key';
 const STORAGE_PRESET_KEY = 'eery_preset_id';
 const STORAGE_CODEC_KEY = 'eery_codec_mode';
-const PREVIEW_CANVAS_MIN_INTERVAL_MS = 50;
 
 const liveStatusPill = document.getElementById('liveStatusPill') as HTMLSpanElement;
 const previewThumb = document.getElementById('previewThumb') as HTMLImageElement;
 const previewVideo = document.getElementById('previewVideo') as HTMLVideoElement;
-const previewCanvas = document.getElementById('previewCanvas') as HTMLCanvasElement;
 const previewEmpty = document.getElementById('previewEmpty') as HTMLDivElement;
 const tabScreens = document.getElementById('tabScreens') as HTMLButtonElement;
 const tabWindows = document.getElementById('tabWindows') as HTMLButtonElement;
@@ -49,7 +46,6 @@ const statFps = document.getElementById('statFps') as HTMLSpanElement;
 const statBitrate = document.getElementById('statBitrate') as HTMLSpanElement;
 const errorBanner = document.getElementById('errorBanner') as HTMLDivElement;
 const streamBtn = document.getElementById('streamBtn') as HTMLButtonElement;
-const previewCanvasCtx = previewCanvas.getContext('2d');
 
 let gpuInfo: GpuInfo = {
   vendor: 'software',
@@ -60,7 +56,6 @@ let gpuInfo: GpuInfo = {
 let capabilities: SystemCapabilities = {
   windowsBuild: 0,
   supportsAppAudio: false,
-  dxgiWindowCrop: false,
 };
 
 const rawStoredMode = localStorage.getItem(STORAGE_CODEC_KEY);
@@ -82,7 +77,6 @@ let isLive = false;
 let isStarting = false;
 let liveStartedAt = 0;
 let liveClockTimer: number | null = null;
-let lastPreviewDrawAt = 0;
 let liveLabelEl: HTMLSpanElement | null = null;
 const presetButtons = new Map<PresetId, HTMLButtonElement>();
 const sourceCards = new Map<string, HTMLButtonElement>();
@@ -139,11 +133,10 @@ function updateAudioLabel(): void {
   audioToggleLabel.textContent = 'Áudio da tela';
 }
 
-function syncPreviewDisplay(mode: 'empty' | 'thumb' | 'video' | 'canvas'): void {
+function syncPreviewDisplay(mode: 'empty' | 'thumb' | 'video'): void {
   previewEmpty.classList.toggle('hidden', mode !== 'empty');
   previewThumb.classList.toggle('hidden', mode !== 'thumb');
   previewVideo.classList.toggle('hidden', mode !== 'video');
-  previewCanvas.classList.toggle('hidden', mode !== 'canvas');
 
   if (mode === 'thumb' && selectedSource) {
     previewThumb.src = selectedSource.thumbnailDataUrl;
@@ -151,19 +144,6 @@ function syncPreviewDisplay(mode: 'empty' | 'thumb' | 'video' | 'canvas'): void 
   } else if (mode !== 'thumb') {
     previewThumb.removeAttribute('src');
   }
-}
-
-function drawPreviewCanvas(source: CanvasImageSource, width: number, height: number): void {
-  if (!previewCanvasCtx || document.hidden) return;
-  const now = performance.now();
-  if (now - lastPreviewDrawAt < PREVIEW_CANVAS_MIN_INTERVAL_MS) return;
-  lastPreviewDrawAt = now;
-
-  if (previewCanvas.width !== width || previewCanvas.height !== height) {
-    previewCanvas.width = width;
-    previewCanvas.height = height;
-  }
-  previewCanvasCtx.drawImage(source, 0, 0, width, height);
 }
 
 function syncPresetButtons(): void {
@@ -335,31 +315,16 @@ function cleanupStreamResources(): void {
     activeStream = null;
   }
   previewVideo.srcObject = null;
-  if (previewCanvasCtx && previewCanvas.width > 0 && previewCanvas.height > 0) {
-    previewCanvasCtx.clearRect(0, 0, previewCanvas.width, previewCanvas.height);
-  }
   void window.eery.stopCapture();
 }
 
-async function acquireDisplayStream(
-  captureMode: CaptureMode,
-  preset: StreamPreset,
-): Promise<MediaStream> {
-  const videoConstraints: MediaTrackConstraints =
-    captureMode === 'dxgi-window'
-      ? {
-          width: { max: 3840 },
-          height: { max: 2160 },
-          frameRate: { ideal: preset.framerate, max: preset.framerate },
-        }
-      : {
-          width: { ideal: preset.width, max: preset.width },
-          height: { ideal: preset.height, max: preset.height },
-          frameRate: { ideal: preset.framerate, max: preset.framerate },
-        };
-
+async function acquireDisplayStream(preset: StreamPreset): Promise<MediaStream> {
   const stream = await navigator.mediaDevices.getDisplayMedia({
-    video: videoConstraints,
+    video: {
+      width: { ideal: preset.width, max: preset.width },
+      height: { ideal: preset.height, max: preset.height },
+      frameRate: { ideal: preset.framerate, max: preset.framerate },
+    },
     audio: false,
   });
 
@@ -410,8 +375,8 @@ async function startTransmission(): Promise<void> {
   syncButtonsState();
 
   try {
-    const prepared = await window.eery.prepareCapture(targetSource.id);
-    const stream = await acquireDisplayStream(prepared.captureMode, preset);
+    await window.eery.prepareCapture(targetSource.id);
+    const stream = await acquireDisplayStream(preset);
 
     if (!isStarting) {
       for (const track of stream.getTracks()) track.stop();
@@ -421,16 +386,9 @@ async function startTransmission(): Promise<void> {
 
     activeStream = stream;
     bindTrackEnded(stream);
-
-    if (prepared.captureMode === 'dxgi-window') {
-      previewVideo.srcObject = null;
-      lastPreviewDrawAt = 0;
-      syncPreviewDisplay('canvas');
-    } else {
-      previewVideo.srcObject = stream;
-      await previewVideo.play().catch(() => undefined);
-      syncPreviewDisplay('video');
-    }
+    previewVideo.srcObject = stream;
+    await previewVideo.play().catch(() => undefined);
+    syncPreviewDisplay('video');
 
     isStarting = false;
     isLive = true;
@@ -445,29 +403,11 @@ async function startTransmission(): Promise<void> {
       wsUrl,
       streamKey,
       sourceId: targetSource.id,
-      captureMode: prepared.captureMode,
-      initialBounds: prepared.initialBounds,
       captureAudio: audioToggle.checked,
       stream,
       probed,
       preset,
       onStats: updateStatsView,
-      onPreviewCanvasFrame:
-        prepared.captureMode === 'dxgi-window' ? drawPreviewCanvas : undefined,
-      onScreenMoved:
-        prepared.captureMode === 'dxgi-window'
-          ? async (screenSourceId) => {
-              await window.eery.switchScreenSource(screenSourceId);
-              const nextStream = await acquireDisplayStream('dxgi-window', preset);
-              if (!isLive || transmitter !== tx) {
-                for (const track of nextStream.getTracks()) track.stop();
-                return null;
-              }
-              activeStream = nextStream;
-              bindTrackEnded(nextStream);
-              return nextStream;
-            }
-          : undefined,
       onStatusChange: (status, detail) => {
         if (status === 'connecting') {
           updateLivePill('connecting');
